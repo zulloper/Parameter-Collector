@@ -17,6 +17,8 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import com.google.gson.JsonParser;
+import com.google.gson.JsonElement;
 
 import javax.swing.*;
 import javax.swing.table.DefaultTableModel;
@@ -39,6 +41,12 @@ import javax.swing.event.DocumentListener;
 import java.awt.Toolkit;
 import javax.swing.JPopupMenu;
 import javax.swing.JMenuItem;
+import java.io.File;
+import java.io.FileReader;
+import java.io.FileWriter;
+import java.io.IOException;
+import javax.swing.JFileChooser;
+import javax.swing.filechooser.FileNameExtensionFilter;
 
 public class ParameterCollector implements BurpExtension {
     private MontoyaApi api;
@@ -53,6 +61,11 @@ public class ParameterCollector implements BurpExtension {
     private int maxParamNameLength = 30;
     private int maxParamValueLength = 100;
     private String filterKeyword = "";
+    
+    // 자동 내보내기 설정
+    private boolean autoExportEnabled = false;
+    private String autoExportPath = "";
+    private final Object autoExportLock = new Object();
 
     @Override
     public void initialize(MontoyaApi api) {
@@ -134,9 +147,18 @@ public class ParameterCollector implements BurpExtension {
             public void removeUpdate(DocumentEvent e) { updateParamTabWithSearch(); }
             public void changedUpdate(DocumentEvent e) { updateParamTabWithSearch(); }
         });
+        
+        // 내보내기 버튼 추가
+        JButton exportButton = new JButton("JSON 내보내기");
+        exportButton.addActionListener(e -> exportToJson());
+        
+        JPanel bottomPanel = new JPanel(new BorderLayout());
+        bottomPanel.add(searchField, BorderLayout.CENTER);
+        bottomPanel.add(exportButton, BorderLayout.EAST);
+        
         JPanel paramPanel = new JPanel(new BorderLayout());
         paramPanel.add(new JScrollPane(paramTable), BorderLayout.CENTER);
-        paramPanel.add(searchField, BorderLayout.SOUTH);
+        paramPanel.add(bottomPanel, BorderLayout.SOUTH);
         resultTabs.addTab("파라미터", paramPanel);
         resultTabs.addTab("JSON", new JScrollPane(jsonArea));
         resultTabs.addChangeListener(e -> {
@@ -233,18 +255,52 @@ public class ParameterCollector implements BurpExtension {
         JTextField nameLenField = new JTextField(String.valueOf(maxParamNameLength));
         JTextField valueLenField = new JTextField(String.valueOf(maxParamValueLength));
         JTextField filterField = new JTextField(filterKeyword);
+        
+        // 자동 내보내기 설정 추가
+        JCheckBox autoExportCheckBox = new JCheckBox("자동 내보내기 활성화", autoExportEnabled);
+        JTextField autoExportPathField = new JTextField(autoExportPath);
+        JButton browseButton = new JButton("경로 선택...");
+        browseButton.addActionListener(e -> {
+            JFileChooser fileChooser = new JFileChooser();
+            fileChooser.setFileFilter(new FileNameExtensionFilter("JSON files", "json"));
+            fileChooser.setSelectedFile(new File(autoExportPath.isEmpty() ? "parameters_auto.json" : autoExportPath));
+            if (fileChooser.showSaveDialog(null) == JFileChooser.APPROVE_OPTION) {
+                File file = fileChooser.getSelectedFile();
+                if (!file.getName().endsWith(".json")) {
+                    file = new File(file.getAbsolutePath() + ".json");
+                }
+                autoExportPathField.setText(file.getAbsolutePath());
+            }
+        });
+        
+        JPanel autoExportPanel = new JPanel(new BorderLayout());
+        autoExportPanel.add(autoExportPathField, BorderLayout.CENTER);
+        autoExportPanel.add(browseButton, BorderLayout.EAST);
+        
         panel.add(new JLabel("최대 파라미터 이름 길이:"));
         panel.add(nameLenField);
         panel.add(new JLabel("최대 파라미터 값 길이:"));
         panel.add(valueLenField);
         panel.add(new JLabel("필터링 키워드(비우면 전체):"));
         panel.add(filterField);
+        panel.add(new JLabel(""));
+        panel.add(autoExportCheckBox);
+        panel.add(new JLabel("자동 내보내기 경로:"));
+        panel.add(autoExportPanel);
+        
         int result = JOptionPane.showConfirmDialog(null, panel, "Parameter Collector 설정", JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
         if (result == JOptionPane.OK_OPTION) {
             try {
                 maxParamNameLength = Integer.parseInt(nameLenField.getText());
                 maxParamValueLength = Integer.parseInt(valueLenField.getText());
                 filterKeyword = filterField.getText();
+                autoExportEnabled = autoExportCheckBox.isSelected();
+                autoExportPath = autoExportPathField.getText();
+                
+                // 자동 내보내기가 활성화되고 경로가 설정되어 있으면 초기 저장
+                if (autoExportEnabled && !autoExportPath.isEmpty()) {
+                    performAutoExport();
+                }
             } catch (NumberFormatException e) {
                 JOptionPane.showMessageDialog(null, "숫자를 올바르게 입력하세요.");
             }
@@ -293,8 +349,18 @@ public class ParameterCollector implements BurpExtension {
             if (paramValue.length() > maxParamValueLength) {
                 paramValue = paramValue.substring(0, maxParamValueLength) + "...";
             }
-            parameterValues.computeIfAbsent(paramName, k -> new CopyOnWriteArrayList<>()).add(paramValue);
-            updateResultTabs();
+            CopyOnWriteArrayList<String> values = parameterValues.computeIfAbsent(paramName, k -> new CopyOnWriteArrayList<>());
+            // 중복 체크 후 추가
+            if (!values.contains(paramValue)) {
+                values.add(paramValue);
+                updateResultTabs();
+                
+                // 자동 내보내기 수행
+                if (autoExportEnabled && !autoExportPath.isEmpty()) {
+                    // 별도 스레드에서 실행하여 성능 영향 최소화
+                    new Thread(() -> performAutoExport()).start();
+                }
+            }
         }
     }
 
@@ -305,6 +371,145 @@ public class ParameterCollector implements BurpExtension {
             updateJsonTab();
         } else if ("파라미터".equals(title)) {
             updateParamTabWithSearch();
+        }
+    }
+    
+    private void exportToJson() {
+        JFileChooser fileChooser = new JFileChooser();
+        fileChooser.setFileFilter(new FileNameExtensionFilter("JSON files", "json"));
+        fileChooser.setSelectedFile(new File("parameters.json"));
+        
+        int result = fileChooser.showSaveDialog(null);
+        if (result == JFileChooser.APPROVE_OPTION) {
+            File file = fileChooser.getSelectedFile();
+            if (!file.getName().endsWith(".json")) {
+                file = new File(file.getAbsolutePath() + ".json");
+            }
+            
+            try {
+                JsonArray exportData = createExportData();
+                JsonArray existingData = new JsonArray();
+                
+                // 기존 파일이 있으면 읽어서 중복 체크
+                if (file.exists()) {
+                    try (FileReader reader = new FileReader(file)) {
+                        JsonElement element = JsonParser.parseReader(reader);
+                        if (element.isJsonArray()) {
+                            existingData = element.getAsJsonArray();
+                        }
+                    }
+                }
+                
+                // 중복되지 않는 항목만 추가
+                JsonArray mergedData = mergeJsonData(existingData, exportData);
+                
+                // 파일에 저장
+                try (FileWriter writer = new FileWriter(file)) {
+                    Gson gson = new GsonBuilder().setPrettyPrinting().create();
+                    gson.toJson(mergedData, writer);
+                }
+                
+                JOptionPane.showMessageDialog(null, "JSON 파일이 성공적으로 저장되었습니다.");
+            } catch (IOException e) {
+                JOptionPane.showMessageDialog(null, "파일 저장 중 오류 발생: " + e.getMessage(), "오류", JOptionPane.ERROR_MESSAGE);
+            }
+        }
+    }
+    
+    private JsonArray createExportData() {
+        JsonArray result = new JsonArray();
+        for (Map.Entry<String, CopyOnWriteArrayList<String>> entry : parameterValues.entrySet()) {
+            if (!filterKeyword.isEmpty() && !entry.getKey().contains(filterKeyword)) continue;
+            JsonObject paramObj = new JsonObject();
+            paramObj.addProperty("name", entry.getKey());
+            JsonArray valuesArray = new JsonArray();
+            for (String value : entry.getValue()) {
+                if (!filterKeyword.isEmpty() && !value.contains(filterKeyword)) continue;
+                valuesArray.add(value);
+            }
+            paramObj.add("values", valuesArray);
+            result.add(paramObj);
+        }
+        return result;
+    }
+    
+    private JsonArray mergeJsonData(JsonArray existing, JsonArray newData) {
+        Map<String, CopyOnWriteArrayList<String>> mergedMap = new HashMap<>();
+        
+        // 기존 데이터를 맵에 추가
+        for (JsonElement element : existing) {
+            JsonObject obj = element.getAsJsonObject();
+            String name = obj.get("name").getAsString();
+            JsonArray values = obj.get("values").getAsJsonArray();
+            CopyOnWriteArrayList<String> valueList = mergedMap.computeIfAbsent(name, k -> new CopyOnWriteArrayList<>());
+            for (JsonElement value : values) {
+                String val = value.getAsString();
+                if (!valueList.contains(val)) {
+                    valueList.add(val);
+                }
+            }
+        }
+        
+        // 새 데이터를 맵에 추가 (중복 체크)
+        for (JsonElement element : newData) {
+            JsonObject obj = element.getAsJsonObject();
+            String name = obj.get("name").getAsString();
+            JsonArray values = obj.get("values").getAsJsonArray();
+            CopyOnWriteArrayList<String> valueList = mergedMap.computeIfAbsent(name, k -> new CopyOnWriteArrayList<>());
+            for (JsonElement value : values) {
+                String val = value.getAsString();
+                if (!valueList.contains(val)) {
+                    valueList.add(val);
+                }
+            }
+        }
+        
+        // 맵을 다시 JsonArray로 변환
+        JsonArray result = new JsonArray();
+        for (Map.Entry<String, CopyOnWriteArrayList<String>> entry : mergedMap.entrySet()) {
+            JsonObject paramObj = new JsonObject();
+            paramObj.addProperty("name", entry.getKey());
+            JsonArray valuesArray = new JsonArray();
+            for (String value : entry.getValue()) {
+                valuesArray.add(value);
+            }
+            paramObj.add("values", valuesArray);
+            result.add(paramObj);
+        }
+        
+        return result;
+    }
+    
+    private void performAutoExport() {
+        synchronized (autoExportLock) {
+            try {
+                File file = new File(autoExportPath);
+                JsonArray exportData = createExportData();
+                JsonArray existingData = new JsonArray();
+                
+                // 기존 파일이 있으면 읽어서 중복 체크
+                if (file.exists()) {
+                    try (FileReader reader = new FileReader(file)) {
+                        JsonElement element = JsonParser.parseReader(reader);
+                        if (element.isJsonArray()) {
+                            existingData = element.getAsJsonArray();
+                        }
+                    }
+                }
+                
+                // 중복되지 않는 항목만 추가
+                JsonArray mergedData = mergeJsonData(existingData, exportData);
+                
+                // 파일에 저장
+                try (FileWriter writer = new FileWriter(file)) {
+                    Gson gson = new GsonBuilder().setPrettyPrinting().create();
+                    gson.toJson(mergedData, writer);
+                }
+                
+                api.logging().logToOutput("[Parameter Collector] 자동 내보내기 완료: " + autoExportPath);
+            } catch (IOException e) {
+                api.logging().logToError("[Parameter Collector] 자동 내보내기 실패: " + e.getMessage());
+            }
         }
     }
 } 
